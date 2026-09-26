@@ -4,6 +4,7 @@
 按原时刻排序后在相邻锚点间做线性插值，两端按最近一段的斜率外推，
 统一换算每条字幕的起止时间，并检测负时间 / 起止倒置 / 与下一条重叠。
 """
+import bisect
 import csv
 import difflib
 import io
@@ -49,16 +50,72 @@ def fmt_time(ms: int) -> str:
 
 # ---------------------------------------------------------------- SRT 解析
 
-def parse_srt(text: str) -> List[dict]:
-    """解析 SRT，保留序号与正文。返回 [{index, start, end, lines}]。"""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n﻿ ")
-    if not text:
+# 行终止符：\r\n 为整体，单独的 \r 不得紧跟 \n（否则 \r\n 会被回溯拆成
+# \r + \n 两个终止符，CRLF 换行被误判为空行间隔）；同一文件可混用 CRLF/LF/CR
+_LINE_TERM_RE = re.compile(r"\r\n|\r(?!\n)|\n")
+# 块间分隔：两个行终止符之间可夹空格 / 制表符（对应规范化文本的 "\n[ \t]*\n"）
+_BLOCK_SEP_RE = re.compile(r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r(?!\n)|\n)")
+# 全文首尾忽略的字符：换行、BOM、空格（\r 规范化后即 \n，对应 strip("\n﻿ ")）
+_EDGE_STRIP_CHARS = "\r\n﻿ "
+
+
+def parse_srt_doc(text: str) -> dict:
+    """唯一 SRT 解析器：单次扫描同时产出规范化条目与原文跨度。
+
+    返回 {"entries": [...], "blocks": [...]}，两者一一对应：
+    - entries：[{index, start, end, lines}]，条目内容在「CRLF / CR 统一
+      视为 LF」的规范化意义上提取（行内容本身不含换行符，与原文逐字相同）；
+    - blocks：原文（未规范化）字符跨度——
+        start / end：整个字幕块（相邻块间分隔之间，含块内空行）；
+        index：序号行内容跨度（时间行即首条非空白行时为 None）；
+        time：完整时间行内容跨度（含 X1/X2 等定位字段，不含行终止符）；
+        head_end：时间行行终止符之后的位置（序号行 + 完整时间行的终点）；
+        body：各正文行内容跨度，与 entries[i]["lines"] 一一对应
+              （text[s:e] 即对应行内容；全空白行不进入条目，同样被丢弃）；
+        sep：块后的块间分隔跨度（最后一块为 None）。
+    """
+    # 对应规范化后的 strip("\n﻿ ")：忽略全文首尾的换行、BOM、空格
+    lo, hi = 0, len(text)
+    while lo < hi and text[lo] in _EDGE_STRIP_CHARS:
+        lo += 1
+    while hi > lo and text[hi - 1] in _EDGE_STRIP_CHARS:
+        hi -= 1
+    if lo >= hi:
         raise ValueError("SRT 内容为空")
+
     entries = []
-    for block in re.split(r"\n[ \t]*\n", text):
-        lines = [ln for ln in block.strip("\n").split("\n") if ln.strip() != ""]
-        if not lines:
-            continue
+    blocks = []
+    pos = lo
+    while True:
+        m = _BLOCK_SEP_RE.search(text, pos, hi)
+        if m is None:
+            bs, be, sep = pos, hi, None
+        else:
+            bs, be, sep = pos, m.start(), (m.start(), m.end())
+        # 去掉块首尾的空行（对应 block.strip("\n")；\r 规范化后即 \n）
+        cs, ce = bs, be
+        while cs < ce and text[cs] in "\r\n":
+            cs += 1
+        while ce > cs and text[ce - 1] in "\r\n":
+            ce -= 1
+        # 切行并丢弃全空白行（保留非空白行的原行内容）
+        kept = []  # (行内容, 内容起点, 内容终点, 行终止符终点)
+        p = cs
+        for lm in _LINE_TERM_RE.finditer(text, cs, ce):
+            ln = text[p:lm.start()]
+            if ln.strip() != "":
+                kept.append((ln, p, lm.start(), lm.end()))
+            p = lm.end()
+        if p < ce:
+            ln = text[p:ce]
+            if ln.strip() != "":
+                kept.append((ln, p, ce, ce))
+        if not kept:
+            if m is None:
+                break
+            pos = m.end()
+            continue  # 空块 / 全空白块：跳过
+        lines = [k[0] for k in kept]
         # 找到包含 --> 的时间行，其上一行（若有）为序号
         ti = next((i for i, ln in enumerate(lines) if ARROW_RE.search(ln)), None)
         if ti is None:
@@ -80,9 +137,29 @@ def parse_srt(text: str) -> List[dict]:
             "end": end,
             "lines": lines[ti + 1:],
         })
+        blocks.append({
+            "start": bs,
+            "end": be,
+            "index": (kept[0][1], kept[0][2]) if ti > 0 else None,
+            "time": (kept[ti][1], kept[ti][2]),
+            "head_end": kept[ti][3],
+            "body": [(k[1], k[2]) for k in kept[ti + 1:]],
+            "sep": sep,
+        })
+        if m is None:
+            break
+        pos = m.end()
     if not entries:
         raise ValueError("未解析到任何字幕块")
-    return entries
+    return {"entries": entries, "blocks": blocks}
+
+
+def parse_srt(text: str) -> List[dict]:
+    """解析 SRT，保留序号与正文。返回 [{index, start, end, lines}]。
+
+    兼容入口：条目由唯一解析器 parse_srt_doc 生成（原文跨度在此丢弃）。
+    """
+    return parse_srt_doc(text)["entries"]
 
 
 # ---------------------------------------------------------------- 锚点与映射
@@ -531,8 +608,6 @@ def _pair_ordered_dp(mains: List[dict], trans: List[dict]):
     每个译文窗口只被常数个主轨覆盖，总状态 O(m+n)。轨内可有序重叠时窗口变
     宽，最差退化到 O(m*n)，仍正确。
     """
-    import bisect
-
     m, n = len(mains), len(trans)
     seq_bit, bonus, shift_cnt = _weight_params(m, n)
     t_starts = [e["start"] for e in trans]
@@ -2979,112 +3054,49 @@ def _apply_term_hits(text: str, adopted: List[dict]) -> str:
 
 
 def _term_prepare(req: "TermRequest"):
-    """术语统一替换公共预处理：解析 SRT 与逐行术语并汇总别名，失败抛 400。"""
+    """术语统一替换公共预处理：解析 SRT（含原文跨度）与逐行术语并汇总别名，失败抛 400。"""
     try:
-        entries = parse_srt(req.srt)
+        doc = parse_srt_doc(req.srt)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     try:
         terms = _parse_term_lines(req.terms)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return entries, terms, _collect_term_aliases(terms)
+    return doc, terms, _collect_term_aliases(terms)
 
 
-# ---- 导出时的原文块定位 ------------------------------------------------
+# ---- 导出时的原文替换区间 ------------------------------------------------
 #
-# parse_srt 会丢弃原文件的排版信息（时间行附带的 X1/X2 等定位字段、原有
-# 换行风格、块间空行、全空白行等），按解析结果重新拼装会破坏原格式。
-# 这里按与 parse_srt 完全一致的切块规则在原始文本中定位每个字幕块：
-# 导出时未改动块原样输出，改动块只替换正文行内容，其余部分逐字保留。
-
-_TERM_STRIP_CHARS = "\r\n﻿ "           # 对应 parse_srt 规范化后的 strip("\n﻿ ")
-# 与 parse_srt 相同的行终止符：\r\n 为整体，单独的 \r 不得紧跟 \n（否则 \r\n
-# 会被回溯拆成 \r + \n 两个终止符，CRLF 换行被误判为空行间隔）
-_TERM_LINE_RE = re.compile(r"\r\n|\r(?!\n)|\n")
-_TERM_SEP_RE = re.compile(r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r(?!\n)|\n)")  # 对应 "\n[ \t]*\n"
+# parse_srt_doc 已给出每条字幕正文行在原文中的字符跨度（与 entry["lines"]
+# 一一对应），导出据此把采用命中换算回原文区间、只替换这些区间：BOM、空格、
+# 时间行定位字段、块间分隔与换行等未命中部分逐字符保留。
 
 
-def _locate_srt_blocks(text: str) -> List[dict]:
-    """按 parse_srt 相同的规则在原始 SRT 文本中定位每个字幕块。
+def _term_hit_raw_spans(entry: dict, blk: dict, aliases: List[dict]) -> List[tuple]:
+    """采用命中在原文中的替换区间 [(起点, 终点, 标准词)]，按起点升序。
 
-    返回 [{"start", "end", "head_end", "body_lines"}]，均为原文（未规范化）
-    字符偏移：
-    - [start, end)：整个字幕块（不含块间空行等间隔）；
-    - [start, head_end)：序号行与完整时间行（含时间行附带的 X1/X2 等定位
-      字段，含时间行的行终止符）；
-    - body_lines：时间行之后各正文行 (c_start, c_end, t_end)，行内容为
-      [c_start, c_end)，原行终止符为 [c_end, t_end)。
-
-    与 parse_srt 的对应关系：块序列一致；body_lines 过滤掉全空白行后的
-    行内容即对应 entries[i]["lines"]。
+    命中选择规则与预览一致（_term_entry_result）；命中位置是「多行按换行
+    连接后的正文」的字符偏移，按行换算回原文偏移——别名不含换行，命中
+    不会跨行，故每个命中都完整落在某一正文行内。
     """
-    lo, hi = 0, len(text)
-    while lo < hi and text[lo] in _TERM_STRIP_CHARS:
-        lo += 1
-    while hi > lo and text[hi - 1] in _TERM_STRIP_CHARS:
-        hi -= 1
-    spans, pos = [], lo
-    for m in _TERM_SEP_RE.finditer(text, lo, hi):
-        spans.append((pos, m.start()))
-        pos = m.end()
-    spans.append((pos, hi))
-    blocks = []
-    for s, e in spans:
-        if not text[s:e].strip():
-            continue  # 空块 / 全空白块：parse_srt 同样跳过
-        lines = []
-        p = s
-        for m in _TERM_LINE_RE.finditer(text, s, e):
-            lines.append((p, m.start(), m.end()))
-            p = m.end()
-        if p < e:
-            lines.append((p, e, e))
-        ti = next(
-            (k for k, (cs, ce, _te) in enumerate(lines)
-             if ARROW_RE.search(text[cs:ce])),
-            None,
-        )
-        if ti is None:
-            raise ValueError("原文块定位失败：缺少时间行（内部错误）")
-        blocks.append({
-            "start": s,
-            "end": e,
-            "head_end": lines[ti][2],
-            "body_lines": lines[ti + 1:],
-        })
-    return blocks
-
-
-def _check_term_blocks(text: str, blocks: List[dict], entries: List[dict]) -> None:
-    """防御性校验：定位块与 parse_srt 结果逐块一致（构造上必然成立）。"""
-    if len(blocks) != len(entries):
-        raise ValueError("原文块定位与解析不一致（内部错误）")
-    for blk, e in zip(blocks, entries):
-        body = [text[cs:ce] for cs, ce, _te in blk["body_lines"]
-                if text[cs:ce].strip()]
-        if body != e["lines"]:
-            raise ValueError("原文块定位与解析不一致（内部错误）")
-
-
-def _rebuild_term_block(text: str, blk: dict, revised: str) -> str:
-    """重组改动块：头部（序号行 + 完整时间行）原样保留，正文逐行替换。
-
-    revised 为正文（多行按换行连接）的修订结果；替换不产生新行（别名与
-    标准词都不含换行），故与过滤后的正文行逐行对应。全空白行（parse_srt
-    丢弃的行）与各行的原行终止符原样保留。
-    """
-    revised_lines = revised.split("\n")
-    parts = [text[blk["start"]:blk["head_end"]]]
-    ri = 0
-    for cs, ce, te in blk["body_lines"]:
-        if text[cs:ce].strip():
-            parts.append(revised_lines[ri])
-            ri += 1
-        else:
-            parts.append(text[cs:ce])  # 全空白行原样保留
-        parts.append(text[ce:te])      # 原行终止符（块末行无终止符时为空）
-    return "".join(parts)
+    r = _term_entry_result(entry, aliases)
+    if not r["changed"]:
+        return []
+    line_start = []  # 各正文行在连接后正文中的起始偏移（行间以 \n 连接）
+    off = 0
+    for ln in entry["lines"]:
+        line_start.append(off)
+        off += len(ln) + 1
+    spans = []
+    for h in r["hits"]:
+        if not h["adopted"]:
+            continue
+        k = bisect.bisect_right(line_start, h["start"]) - 1
+        cs = blk["body"][k][0]
+        spans.append((cs + h["start"] - line_start[k],
+                      cs + h["end"] - line_start[k], h["std"]))
+    return spans
 
 
 def _term_entry_result(entry: dict, aliases: List[dict]) -> dict:
@@ -3131,7 +3143,8 @@ def _term_entry_result(entry: dict, aliases: List[dict]) -> dict:
 
 @app.post("/api/terms/preview")
 def terms_preview(req: TermRequest):
-    entries, terms, aliases = _term_prepare(req)
+    doc, terms, aliases = _term_prepare(req)
+    entries = doc["entries"]
     items = []
     hit_count = adopted_count = changed_count = 0
     for i, e in enumerate(entries, 1):
@@ -3159,20 +3172,18 @@ def terms_preview(req: TermRequest):
 
 @app.post("/api/terms/export")
 def terms_export(req: TermRequest):
-    entries, _terms, aliases = _term_prepare(req)
-    blocks = _locate_srt_blocks(req.srt)
-    _check_term_blocks(req.srt, blocks, entries)
+    doc, _terms, aliases = _term_prepare(req)
+    replacements = []  # (起点, 终点, 标准词)；条目有序、条目内按起点升序
+    for entry, blk in zip(doc["entries"], doc["blocks"]):
+        # 与预览同一套重叠命中选择规则，只改采用命中的正文范围
+        replacements.extend(_term_hit_raw_spans(entry, blk, aliases))
     parts = []
     pos = 0
-    for blk, e in zip(blocks, entries):
-        r = _term_entry_result(e, aliases)  # 与预览同一套重叠命中选择规则
-        parts.append(req.srt[pos:blk["start"]])  # 块前间隔（空行等）原样保留
-        if r["changed"]:
-            parts.append(_rebuild_term_block(req.srt, blk, r["revised"]))
-        else:
-            parts.append(req.srt[blk["start"]:blk["end"]])  # 未改动块原样保留
-        pos = blk["end"]
-    parts.append(req.srt[pos:])  # 尾部原样保留；全部未改动时内容即提交的原文
+    for rs, re_, std in replacements:
+        parts.append(req.srt[pos:rs])  # 命中前的原文逐字保留
+        parts.append(std)
+        pos = re_
+    parts.append(req.srt[pos:])  # 尾部原样保留；无替换时输出即提交的原文
     content = "".join(parts)
     return Response(
         content=content.encode("utf-8"),
